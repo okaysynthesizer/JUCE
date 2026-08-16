@@ -274,11 +274,11 @@ private:
     {
         DylibHandle() = default;
 
-        explicit DylibHandle (const char* str)
+        explicit DylibHandle (const String& str)
             : DylibHandle (str, RTLD_NOW | RTLD_LOCAL) {}
 
-        DylibHandle (const char* str, int flags)
-            : handle (dlopen (str, flags)) {}
+        DylibHandle (const String& str, int flags)
+            : handle (str.isEmpty() ? nullptr : dlopen (str.toRawUTF8(), flags)) {}
 
         ~DylibHandle()
         {
@@ -432,18 +432,31 @@ private:
                             makeSymbolBinding (juce_g_free, "g_free"));
     }
 
+    static DylibHandle openWebKitDependency (const String& unversionedName)
+    {
+        if (const auto resolved = findLoadedSharedLibraryPath (unversionedName); resolved.isNotEmpty())
+            if (DylibHandle lib { resolved }; lib)
+                return lib;
+
+        return DylibHandle { unversionedName };
+    }
+
     struct WebKitAndDependencyLibraryNames
     {
-        const char* webkitLib;
-        const char* jsLib;
+        StringArray webkitLib;   // ordered candidates for the root library
+        const char* jsLib;       // dependencies, resolved via the linker
         const char* soupLib;
     };
 
     bool openWebKitAndDependencyLibraries (const WebKitAndDependencyLibraryNames& names)
     {
-        if (   (webkitLib = DylibHandle (names.webkitLib, RTLD_NOW | RTLD_LOCAL | RTLD_NODELETE))
-            && (jsLib = DylibHandle (names.jsLib))
-            && (soupLib = DylibHandle (names.soupLib)))
+        for (const auto& name : names.webkitLib)
+            if ((webkitLib = DylibHandle (name, RTLD_NOW | RTLD_LOCAL | RTLD_NODELETE)))
+                break;
+
+        if (   webkitLib
+            && (jsLib = openWebKitDependency (names.jsLib))
+            && (soupLib = openWebKitDependency (names.soupLib)))
         {
             return true;
         }
@@ -454,18 +467,32 @@ private:
         return false;
     }
 
+    /* WebKit is one lib that must be named outright, also with pinned soname for ABI
+    compatibility. Bindings above are written for WebKitGTK 4.1 / 4.0 functions.
+    Have unversioned as well for fallback but may fail.
+    */
+    bool openLibraries()
+    {
+        const auto opened = openWebKitAndDependencyLibraries ({ { "libwebkit2gtk-4.1.so.0", "libwebkit2gtk-4.1.so" },
+                                                                "libjavascriptcoregtk-4.1.so",
+                                                                "libsoup-3.0.so" })
+                            || openWebKitAndDependencyLibraries ({ { "libwebkit2gtk-4.0.so.37", "libwebkit2gtk-4.0.so" },
+                                                                   "libjavascriptcoregtk-4.0.so",
+                                                                   "libsoup-2.4.so" });
+
+        if (! opened)
+            return false;
+
+        gtkLib = openWebKitDependency ("libgtk-3.so");
+        glib   = openWebKitDependency ("libglib-2.0.so");
+
+        return gtkLib && glib;
+    }
+
     //==============================================================================
-    DylibHandle webkitLib, jsLib, soupLib;
+    DylibHandle webkitLib, jsLib, soupLib, gtkLib, glib;
 
-    DylibHandle gtkLib    { "libgtk-3.so" },
-                glib      { "libglib-2.0.so" };
-
-    const bool webKitIsAvailable =    (   openWebKitAndDependencyLibraries ({ "libwebkit2gtk-4.1.so",
-                                                                              "libjavascriptcoregtk-4.1.so",
-                                                                              "libsoup-3.0.so" })
-                                       || openWebKitAndDependencyLibraries ({ "libwebkit2gtk-4.0.so",
-                                                                              "libjavascriptcoregtk-4.0.so",
-                                                                              "libsoup-2.4.so" }))
+    const bool webKitIsAvailable =    openLibraries()
                                    && loadWebkitSymbols()
                                    && loadGtkSymbols()
                                    && loadJsLibSymbols()

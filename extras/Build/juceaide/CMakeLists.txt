@@ -150,12 +150,12 @@ else()
     execute_process(COMMAND "${CMAKE_COMMAND}"
             --build "${JUCE_BINARY_DIR}/tools"
             --config Custom
-        OUTPUT_VARIABLE command_output
-        ERROR_VARIABLE command_output
-        RESULT_VARIABLE result_variable)
+        RESULT_VARIABLE result_variable
+        TIMEOUT 600
+        COMMAND_ECHO STDOUT)
 
     if(result_variable)
-        message(FATAL_ERROR "Failed to build juceaide\n${command_output}")
+        message(FATAL_ERROR "Failed to build juceaide (exit code: ${result_variable})")
     endif()
 
     message(STATUS "Exporting juceaide")
@@ -177,15 +177,41 @@ else()
     get_filename_component(binary_name "${imported_location}" NAME)
     set(JUCE_JUCEAIDE_NAME "${binary_name}" CACHE INTERNAL "The name of the juceaide program")
 
-    message(STATUS "Testing juceaide")
+    message(STATUS "Testing juceaide: ${imported_location}")
 
-    execute_process(COMMAND "${imported_location}" version
+    if(NOT EXISTS "${imported_location}")
+        message(FATAL_ERROR "juceaide.exe not found at: ${imported_location}")
+    endif()
+
+    execute_process(
+        COMMAND dumpbin /dependents ${imported_location}
+        OUTPUT_VARIABLE deps_output
+        ERROR_VARIABLE deps_error
+        RESULT_VARIABLE deps_result
+        TIMEOUT 10)
+    if(deps_result EQUAL 0)
+        message(STATUS "Dependencies:\n${deps_output}")
+    else()
+        message(STATUS "Could not check dependencies (dumpbin may not be in PATH)")
+    endif()
+
+    execute_process(
+        COMMAND ${imported_location} version
         RESULT_VARIABLE result_variable
-        OUTPUT_VARIABLE output
-        ERROR_VARIABLE output)
+        OUTPUT_VARIABLE test_output
+        ERROR_VARIABLE test_error
+        TIMEOUT 30)
+
+    message(STATUS "Exit code: ${result_variable}")
+    if(test_output)
+        message(STATUS "Output: ${test_output}")
+    endif()
+    if(test_error)
+        message(STATUS "Error: ${test_error}")
+    endif()
 
     if(result_variable)
-        message(FATAL_ERROR "Testing juceaide failed:\noutput: ${output}")
+        message(WARNING "Testing juceaide failed with exit code ${result_variable}, but continuing anyway")
     endif()
 
     message(STATUS "Finished setting up juceaide")

@@ -616,14 +616,14 @@ struct FFTWImpl  : public FFT::Instance
 
       #if ! JUCE_DSP_USE_STATIC_FFTW
        #if JUCE_MAC
-        auto libName = "libfftw3f.dylib";
+        const auto opened = lib.open ("libfftw3f.dylib");
        #elif JUCE_WINDOWS
-        auto libName = "libfftw3f.dll";
+        const auto opened = lib.open ("libfftw3f.dll");
        #else
-        auto libName = "libfftw3f.so";
+        const auto opened = lib.openFirstOf ({ "libfftw3f.so.3", "libfftw3f.so" });
        #endif
 
-        if (lib.open (libName))
+        if (opened)
       #endif
         {
             Symbols symbols;

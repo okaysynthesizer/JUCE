@@ -1064,11 +1064,58 @@ void JUCE_CALLTYPE Thread::setCurrentThreadAffinityMask ([[maybe_unused]] uint32
 }
 
 //==============================================================================
+#if JUCE_LINUX || JUCE_BSD
+String findLoadedSharedLibraryPath (const String& unversionedName)
+{
+    struct Search
+    {
+        const char* wanted;
+        size_t wantedLength;
+        String result;
+    };
+
+    Search search { unversionedName.toRawUTF8(), (size_t) unversionedName.getNumBytesAsUTF8(), {} };
+
+    if (search.wantedLength == 0)
+        return {};
+
+    dl_iterate_phdr ([] (struct dl_phdr_info* info, size_t, void* data)
+    {
+        auto& s = *static_cast<Search*> (data);
+
+        if (info->dlpi_name == nullptr || info->dlpi_name[0] != '/')
+            return 0;
+
+        const auto* separator = strrchr (info->dlpi_name, '/');
+        const auto* base = separator != nullptr ? separator + 1 : info->dlpi_name;
+
+        // "libgtk-3.so" should match both "libgtk-3.so" and "libgtk-3.so.0".
+        if (strncmp (base, s.wanted, s.wantedLength) != 0)
+            return 0;
+
+        if (const auto suffix = base[s.wantedLength]; suffix != '\0' && suffix != '.')
+            return 0;
+
+        s.result = String::fromUTF8 (info->dlpi_name);
+        return 1;
+    }, &search);
+
+    return search.result;
+}
+#endif
+
 #if ! JUCE_WASM
 bool DynamicLibrary::open (const String& name)
 {
     close();
     handle = dlopen (name.isEmpty() ? nullptr : name.toRawUTF8(), RTLD_LOCAL | RTLD_NOW);
+
+   #if JUCE_LINUX || JUCE_BSD
+    if (handle == nullptr && name.isNotEmpty() && ! name.containsChar ('/'))
+        if (const auto resolved = findLoadedSharedLibraryPath (name); resolved.isNotEmpty())
+            handle = dlopen (resolved.toRawUTF8(), RTLD_LOCAL | RTLD_NOW);
+   #endif
+
     return handle != nullptr;
 }
 

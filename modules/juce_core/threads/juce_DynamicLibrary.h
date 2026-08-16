@@ -35,6 +35,17 @@
 namespace juce
 {
 
+#if JUCE_LINUX || JUCE_BSD || DOXYGEN
+/** Returns the path of an already-loaded shared library, given its unversioned name.
+ * Shared libs are found by soname like "libgtk-3.so.0". Unversioned spelling is a
+ * symlink shipped by dev packages, and may not be present in end-user installs,
+ * and especially some sandboxes like flatpak.
+ * @param unversionedName  the library name without a soname version, e.g. "libgtk-3.so"
+ * @returns                the resolved path, or an empty string if no such library is loaded
+*/
+JUCE_API String findLoadedSharedLibraryPath (const String& unversionedName);
+#endif
+
 /**
     Handles the opening and closing of DLLs.
 
@@ -78,6 +89,21 @@ public:
         @returns true if the library was successfully found and opened.
     */
     bool open (const String& name);
+
+    /** Opens the first of the given libraries that can be found and opened.
+     * Looks up by name, and ideally is named by its versioned soname like
+     * "libfoo.so.1".
+
+        @returns true if any of the libraries was successfully found and opened.
+    */
+    bool openFirstOf (const StringArray& names)
+    {
+        for (const auto& name : names)
+            if (open (name))
+                return true;
+
+        return false;
+    }
 
     /** Releases the currently-open DLL, or has no effect if none was open. */
     void close();

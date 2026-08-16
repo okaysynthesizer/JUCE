@@ -101,9 +101,9 @@ private:
         static DynamicLibrary libcurl;
 
         if (libcurl.getNativeHandle() == nullptr)
-            for (auto libName : { "libcurl.so",
-                                  "libcurl.so.4", "libcurl.so.3",
-                                  "libcurl-gnutls.so.4", "libcurl-gnutls.so.3" })
+            for (auto libName : { "libcurl.so.4", "libcurl.so.3",
+                                  "libcurl-gnutls.so.4", "libcurl-gnutls.so.3",
+                                  "libcurl.so" })
                 if (libcurl.open (libName))
                     break;
 
