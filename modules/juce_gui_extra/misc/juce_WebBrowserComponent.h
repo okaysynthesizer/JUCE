@@ -514,6 +514,53 @@ public:
     static bool areOptionsSupported (const Options& options);
 
     //==============================================================================
+   #if JUCE_LINUX || JUCE_BSD || DOXYGEN
+    /** Linux/BSD only. Points the webview at a self-contained, relocatable WebKitGTK
+        tree instead of the system one.
+
+        On Linux JUCE ships no browser engine: it dlopen()s whatever WebKitGTK the host
+        machine happens to provide. Inside a sandboxed host — a Flatpak DAW built on
+        org.freedesktop.Platform, say — there may not be one, and the sandbox cannot read
+        the system's copy either, so the editor renders blank. Passing a bundle directory
+        here lets an application carry its own engine and stay self-sufficient.
+
+        The directory must have this layout, and every binary in it must resolve its
+        dependencies through an $ORIGIN-relative RPATH rather than the system loader path:
+
+        @code
+        <bundle>/lib/libwebkit2gtk-4.1.so.0                                  (+ its closure)
+        <bundle>/lib/webkit2gtk-4.1/injected-bundle/libwebkit2gtkinjectedbundle.so
+        <bundle>/libexec/webkit2gtk-4.1/WebKitWebProcess                     (+ friends)
+        @endcode
+
+        The engine's helper processes are located through WEBKIT_EXEC_PATH, which stock
+        WebKitGTK reads only in builds configured with ENABLE_DEVELOPER_MODE — a release
+        build compiles that lookup out and consults one hard-coded absolute path. A bundle
+        built without it will load and then abort when it spawns its first web process, so
+        build the engine accordingly.
+
+        Call this before constructing the first WebBrowserComponent; later calls have no
+        effect on webviews that already exist. Pass an empty File to go back to the system
+        engine. If nothing is set here, the JUCE_WEBKIT_BUNDLE_DIR environment variable is
+        consulted instead.
+
+        A configured bundle is deliberately never loaded into the host process — it
+        carries its own GLib/GTK, and a second copy of those inside a host that already
+        uses them is not survivable — so setting this does not pull another toolkit stack
+        into your DAW. Only the webview's child process ever opens it.
+    */
+    static void setWebKitBundleDirectory (const File& bundleDirectory);
+
+    /** Linux/BSD only. Returns the bundle directory in effect, resolving
+        setWebKitBundleDirectory() first and then the JUCE_WEBKIT_BUNDLE_DIR environment
+        variable. Returns an empty File when the system WebKitGTK will be used.
+
+        @see setWebKitBundleDirectory
+    */
+    static File getWebKitBundleDirectory();
+   #endif
+
+    //==============================================================================
     /** Sends the browser to a particular URL.
 
         @param url      the URL to go to.

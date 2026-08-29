@@ -37,8 +37,120 @@
 struct WebKitURISchemeResponse;
 #endif
 
+/*  Declared by <unistd.h> under glibc, but spelled out here because launchChild() hands it
+    to execve() explicitly, and this must resolve at global scope rather than inside
+    namespace juce.
+*/
+extern "C" char** environ;
+
 namespace juce
 {
+
+//==============================================================================
+/*  The WebKitGTK generations this file's bindings are written against, in preference order.
+
+    WebKit is one library that must be named outright, and with a pinned soname for ABI
+    compatibility. The unversioned name is kept as a fallback but may fail: several distros
+    ship it only in their -dev package. Each generation also names the API directory the
+    engine uses for its helper processes and injected bundle, which tracks the same version.
+*/
+struct WebKitGeneration
+{
+    StringArray webkitLib;   // ordered candidates for the root library
+    const char* jsLib;       // dependencies, resolved via the linker
+    const char* soupLib;
+    const char* apiDir;      // names the libexec/ and injected-bundle/ subdirectories
+};
+
+static Span<const WebKitGeneration> getWebKitGenerations()
+{
+    static const WebKitGeneration generations[]
+    {
+        { { "libwebkit2gtk-4.1.so.0",  "libwebkit2gtk-4.1.so" }, "libjavascriptcoregtk-4.1.so", "libsoup-3.0.so", "webkit2gtk-4.1" },
+        { { "libwebkit2gtk-4.0.so.37", "libwebkit2gtk-4.0.so" }, "libjavascriptcoregtk-4.0.so", "libsoup-2.4.so", "webkit2gtk-4.0" },
+    };
+
+    return generations;
+}
+
+//==============================================================================
+/*  A relocatable WebKitGTK tree that an application ships alongside itself, for hosts that
+    have no usable engine of their own — see WebBrowserComponent::setWebKitBundleDirectory().
+
+    Resolution deliberately falls back to an environment variable, because that is the only
+    channel that reaches the place the engine is actually opened. The webview runs in a child
+    process that this one exec()s, so no value stored in this process's memory survives into
+    it, and WebKitGTK locates its helper processes and injected bundle solely through
+    environment variables of its own. Both constraints point the same way.
+*/
+namespace WebKitBundle
+{
+    static File& storage()
+    {
+        static File dir;
+        return dir;
+    }
+
+    static File get()
+    {
+        if (const auto& explicitlySet = storage(); explicitlySet != File())
+            return explicitlySet;
+
+        if (const auto* fromEnv = getenv ("JUCE_WEBKIT_BUNDLE_DIR");
+            fromEnv != nullptr && File::isAbsolutePath (fromEnv))
+        {
+            return File { String { CharPointer_UTF8 { fromEnv } } };
+        }
+
+        return {};
+    }
+
+    static File libDir (const File& b) { return b.getChildFile ("lib"); }
+
+    /*  Half-honouring a bundle is worse than ignoring it: the webview would be reported as
+        available, then fail at the point the engine tries to spawn a web process — a blank
+        editor rather than a clean fallback. So a generation counts only once both pieces
+        that cannot be substituted from the host are present: the engine itself, and the
+        helper process it will go looking for on the first page load.
+    */
+    static const WebKitGeneration* findGeneration (const File& b)
+    {
+        if (b == File())
+            return nullptr;
+
+        for (const auto& generation : getWebKitGenerations())
+        {
+            const auto hasEngine = std::any_of (generation.webkitLib.begin(),
+                                                generation.webkitLib.end(),
+                                                [&] (const auto& name)
+                                                {
+                                                    return libDir (b).getChildFile (name).existsAsFile();
+                                                });
+
+            if (hasEngine && b.getChildFile ("libexec")
+                              .getChildFile (generation.apiDir)
+                              .getChildFile ("WebKitWebProcess")
+                              .existsAsFile())
+            {
+                return &generation;
+            }
+        }
+
+        return nullptr;
+    }
+
+    static bool isUsable (const File& b)  { return findGeneration (b) != nullptr; }
+
+    static File execPath (const File& b, const WebKitGeneration& g)
+    {
+        return b.getChildFile ("libexec").getChildFile (g.apiDir);
+    }
+
+    static File injectedPath (const File& b, const WebKitGeneration& g)
+    {
+        return libDir (b).getChildFile (g.apiDir).getChildFile ("injected-bundle");
+    }
+} // namespace WebKitBundle
 
 //==============================================================================
 class WebKitSymbols final : public DeletedAtShutdown
@@ -432,8 +544,27 @@ private:
                             makeSymbolBinding (juce_g_free, "g_free"));
     }
 
-    static DylibHandle openWebKitDependency (const String& unversionedName)
+    /*  Where a bundle carries a library, its copy wins outright. A bundle exists so that the
+        engine and the GTK/GLib stack it was built against stay together; completing the set
+        from the host would reintroduce exactly the mismatch it is there to avoid. For
+        anything the bundle does not carry — and whenever no bundle is configured — this
+        returns the name untouched, leaving resolution to the system loader as before.
+    */
+    String resolveLibrary (const String& name) const
     {
+        if (bundle != File())
+            if (const auto inBundle = WebKitBundle::libDir (bundle).getChildFile (name); inBundle.existsAsFile())
+                return inBundle.getFullPathName();
+
+        return name;
+    }
+
+    DylibHandle openWebKitDependency (const String& unversionedName) const
+    {
+        if (const auto fromBundle = resolveLibrary (unversionedName); fromBundle != unversionedName)
+            if (DylibHandle lib { fromBundle }; lib)
+                return lib;
+
         if (const auto resolved = findLoadedSharedLibraryPath (unversionedName); resolved.isNotEmpty())
             if (DylibHandle lib { resolved }; lib)
                 return lib;
@@ -441,17 +572,10 @@ private:
         return DylibHandle { unversionedName };
     }
 
-    struct WebKitAndDependencyLibraryNames
-    {
-        StringArray webkitLib;   // ordered candidates for the root library
-        const char* jsLib;       // dependencies, resolved via the linker
-        const char* soupLib;
-    };
-
-    bool openWebKitAndDependencyLibraries (const WebKitAndDependencyLibraryNames& names)
+    bool openWebKitAndDependencyLibraries (const WebKitGeneration& names)
     {
         for (const auto& name : names.webkitLib)
-            if ((webkitLib = DylibHandle (name, RTLD_NOW | RTLD_LOCAL | RTLD_NODELETE)))
+            if ((webkitLib = DylibHandle (resolveLibrary (name), RTLD_NOW | RTLD_LOCAL | RTLD_NODELETE)))
                 break;
 
         if (   webkitLib
@@ -467,18 +591,15 @@ private:
         return false;
     }
 
-    /* WebKit is one lib that must be named outright, also with pinned soname for ABI
-    compatibility. Bindings above are written for WebKitGTK 4.1 / 4.0 functions.
-    Have unversioned as well for fallback but may fail.
-    */
     bool openLibraries()
     {
-        const auto opened = openWebKitAndDependencyLibraries ({ { "libwebkit2gtk-4.1.so.0", "libwebkit2gtk-4.1.so" },
-                                                                "libjavascriptcoregtk-4.1.so",
-                                                                "libsoup-3.0.so" })
-                            || openWebKitAndDependencyLibraries ({ { "libwebkit2gtk-4.0.so.37", "libwebkit2gtk-4.0.so" },
-                                                                   "libjavascriptcoregtk-4.0.so",
-                                                                   "libsoup-2.4.so" });
+        const auto& generations = getWebKitGenerations();
+        const auto opened = std::any_of (generations.begin(),
+                                         generations.end(),
+                                         [this] (const auto& generation)
+                                         {
+                                             return openWebKitAndDependencyLibraries (generation);
+                                         });
 
         if (! opened)
             return false;
@@ -490,6 +611,9 @@ private:
     }
 
     //==============================================================================
+    // Declared ahead of the handles below: resolveLibrary() consults it while they load.
+    const File bundle = WebKitBundle::get();
+
     DylibHandle webkitLib, jsLib, soupLib, gtkLib, glib;
 
     const bool webKitIsAvailable =    openLibraries()
@@ -1473,7 +1597,20 @@ public:
               const StringArray& userStrings)
         : Thread (SystemStats::getJUCEVersion() + ": Webview"), browser (browserIn), userAgent (optionsIn.getUserAgent())
     {
-        webKitIsAvailable = WebKitSymbols::getInstance()->isWebKitAvailable();
+        webKitIsAvailable = [&]
+        {
+            /*  A configured bundle is answered from disk rather than by loading it. This is
+                the host's process — a DAW, typically, with its own GTK and GLib already
+                mapped — and the bundle brings its own copies of both; pulling in a second
+                set merely to answer a yes/no question is not survivable. Nothing here ever
+                calls into WebKit in any case: every call happens in the child process, which
+                is where the engine actually gets opened.
+            */
+            if (const auto configured = WebKitBundle::get(); configured != File())
+                return WebKitBundle::isUsable (configured);
+
+            return WebKitSymbols::getInstance()->isWebKitAvailable();
+        }();
         init (InitialisationData { optionsIn.getNativeIntegrationsEnabled(),
                                    optionsIn.getLinuxWkWebViewOptions().getAllowNativeZoomGesture(),
                                    userAgent,
@@ -1748,6 +1885,57 @@ private:
             return arg.toRawUTF8();
         });
 
+        /*  A bundled engine reaches the child through its environment, for two reasons that
+            point the same way: this is a fresh exec(), so nothing held in this process's
+            memory survives into it, and WebKitGTK will only be told where its helper
+            processes and injected bundle live through variables of its own.
+
+            The child gets its own environment rather than this one being mutated, because
+            this environment belongs to the host application — a DAW that never asked to
+            acquire these variables, and whose own library loading we must not perturb.
+
+            Assembled before the fork: between fork() and execve() the child may call only
+            async-signal-safe functions, which is the same reason argv is built above.
+        */
+        std::vector<String> environment;
+
+        if (const auto b = WebKitBundle::get(); const auto* generation = WebKitBundle::findGeneration (b))
+        {
+            const std::pair<const char*, String> overrides[]
+            {
+                { "JUCE_WEBKIT_BUNDLE_DIR",      b.getFullPathName() },
+                { "WEBKIT_EXEC_PATH",            WebKitBundle::execPath     (b, *generation).getFullPathName() },
+                { "WEBKIT_INJECTED_BUNDLE_PATH", WebKitBundle::injectedPath (b, *generation).getFullPathName() },
+            };
+
+            for (auto** entry = environ; entry != nullptr && *entry != nullptr; ++entry)
+            {
+                const String line { CharPointer_UTF8 { *entry } };
+                const auto name = line.upToFirstOccurrenceOf ("=", false, false);
+
+                const auto overridden = std::any_of (std::begin (overrides),
+                                                     std::end (overrides),
+                                                     [&] (const auto& o) { return name == o.first; });
+
+                if (! overridden)
+                    environment.push_back (line);
+            }
+
+            for (const auto& [name, value] : overrides)
+                environment.push_back (String { name } + "=" + value);
+        }
+
+        std::vector<const char*> envp (environment.size() + 1, nullptr);
+        std::transform (environment.begin(), environment.end(), envp.begin(), [] (const auto& entry)
+        {
+            return entry.toRawUTF8();
+        });
+
+        /*  execve() handed this process's own environ is precisely execv(), so the two cases
+            share one call below rather than diverging.
+        */
+        auto* const childEnvironment = environment.empty() ? environ : (char**) envp.data();
+
         auto pid = fork();
 
         if (pid == 0)
@@ -1757,12 +1945,12 @@ private:
 
             if (JUCEApplicationBase::isStandaloneApp())
             {
-                execv (arguments[0].toRawUTF8(), (char**) argv.data());
+                execve (arguments[0].toRawUTF8(), (char**) argv.data(), childEnvironment);
             }
             else
             {
                #if JUCE_USE_EXTERNAL_TEMPORARY_SUBPROCESS
-                execv (arguments[0].toRawUTF8(), (char**) argv.data());
+                execve (arguments[0].toRawUTF8(), (char**) argv.data(), childEnvironment);
                #else
                 // After a fork in a multithreaded program, the child can only safely call
                 // async-signal-safe functions until it calls execv, but if we reached this point
@@ -1900,6 +2088,18 @@ void WebBrowserComponent::clearCookies()
 bool WebBrowserComponent::areOptionsSupported (const Options& options)
 {
     return (options.getBackend() == Options::Backend::defaultBackend);
+}
+
+void WebBrowserComponent::setWebKitBundleDirectory (const File& bundleDirectory)
+{
+    // Has no effect on webviews that already exist: each reads the bundle once, as it is
+    // created, and the child process it spawned has already been given its environment.
+    WebKitBundle::storage() = bundleDirectory;
+}
+
+File WebBrowserComponent::getWebKitBundleDirectory()
+{
+    return WebKitBundle::get();
 }
 
 extern "C" __attribute__ ((visibility ("default"))) int juce_gtkWebkitMain (int argc, const char* const* argv)
