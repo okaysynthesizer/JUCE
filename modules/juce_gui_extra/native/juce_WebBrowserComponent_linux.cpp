@@ -1597,20 +1597,27 @@ public:
               const StringArray& userStrings)
         : Thread (SystemStats::getJUCEVersion() + ": Webview"), browser (browserIn), userAgent (optionsIn.getUserAgent())
     {
-        webKitIsAvailable = [&]
-        {
-            /*  A configured bundle is answered from disk rather than by loading it. This is
-                the host's process — a DAW, typically, with its own GTK and GLib already
-                mapped — and the bundle brings its own copies of both; pulling in a second
-                set merely to answer a yes/no question is not survivable. Nothing here ever
-                calls into WebKit in any case: every call happens in the child process, which
-                is where the engine actually gets opened.
-            */
-            if (const auto configured = WebKitBundle::get(); configured != File())
-                return WebKitBundle::isUsable (configured);
+        /*  A configured bundle is answered from disk rather than by loading it. This is the
+            host's process — a DAW, typically, with its own GTK and GLib already mapped — and
+            the bundle brings its own copies of both; pulling in a second set merely to answer
+            a yes/no question is not survivable. Nothing here ever calls into WebKit in any
+            case: every call happens in the child process, which is where the engine actually
+            gets opened.
 
-            return WebKitSymbols::getInstance()->isWebKitAvailable();
-        }();
+            That makes this answer a guess, and the reason init() below can undo it. File
+            presence is not loadability: a bundle whose libraries name something the host does
+            not have — libselinux on Arch, say — passes every check that can be made from here
+            and then dies in the child, on a machine whose own WebKitGTK was perfectly good.
+        */
+        if (! WebKitBundle::isUsable (activeBundle))
+            activeBundle = File();
+
+        /*  Short-circuits, so a usable bundle still avoids loading the system engine into
+            this process. Only when there is no bundle to try does the system get probed,
+            exactly as it did before bundles existed.
+        */
+        webKitIsAvailable = activeBundle != File()
+                            || WebKitSymbols::getInstance()->isWebKitAvailable();
         init (InitialisationData { optionsIn.getNativeIntegrationsEnabled(),
                                    optionsIn.getLinuxWkWebViewOptions().getAllowNativeZoomGesture(),
                                    userAgent,
@@ -1628,6 +1635,8 @@ public:
     {
         g.fillAll (Colours::white);
     }
+
+    String getUnavailableReason() const override  { return unavailableReason; }
 
     void evaluateJavascript (const String& script, EvaluationCallback callback) override
     {
@@ -1703,16 +1712,69 @@ public:
     }
 
     //==============================================================================
+    /*  Starts the webview, and — this is the part that matters on Linux — treats a bundle
+        that will not start as a reason to try the system engine rather than as the end.
+
+        Whether an engine works can only be discovered in the child process: the parent never
+        opens WebKit, and a bundle is answered from disk. So the authoritative answer arrives
+        here, as a failed handshake, after the guess has already been made. Retrying is what
+        turns "the bundle we shipped is broken on this distro" into a working editor on the
+        host's own engine instead of a blank white component.
+
+        The retry is deliberately one-directional. A bundle exists because the system engine
+        is missing or unreachable, so a failing SYSTEM engine has nothing to fall back to.
+    */
     void init (const InitialisationData& initialisationData)
     {
         if (! webKitIsAvailable)
+        {
+            unavailableReason = "No WebKitGTK engine is available: no usable bundle is"
+                                " installed, and the system has no libwebkit2gtk.";
+            return;
+        }
+
+        if (tryStart (initialisationData))
             return;
 
+        if (activeBundle != File())
+        {
+            const auto failed = activeBundle;
+
+            // Cleared before the retry so launchChild() stops pointing the child at it.
+            activeBundle = File();
+
+            if (WebKitSymbols::getInstance()->isWebKitAvailable() && tryStart (initialisationData))
+            {
+                DBG ("[WebKitBundle] The bundle at " << failed.getFullPathName()
+                       << " could not start a web process; fell back to the system WebKitGTK.");
+                return;
+            }
+
+            unavailableReason = "The bundled WebKitGTK at " + failed.getFullPathName()
+                                + " could not start, and no system WebKitGTK could be used"
+                                  " instead.";
+        }
+        else
+        {
+            unavailableReason = "The system WebKitGTK loaded but could not start a web"
+                                " process.";
+        }
+
+        webKitIsAvailable = false;
+    }
+
+    /*  One attempt, all the way to a webview embedded in the component. Leaves nothing behind
+        when it fails, so the caller can simply call it again with different settings.
+    */
+    bool tryStart (const InitialisationData& initialisationData)
+    {
         launchChild();
 
-        [[maybe_unused]] auto ret = pipe (threadControl);
-
-        jassert (ret == 0);
+        if (pipe (threadControl) != 0)
+        {
+            abandonStart();
+            return false;
+        }
 
         CommandReceiver::setBlocking (inChannel,        true);
         CommandReceiver::setBlocking (outChannel,       true);
@@ -1721,13 +1783,18 @@ public:
 
         CommandReceiver::sendCommand (outChannel, "init", *ToVar::convert (initialisationData));
 
+        /*  The handshake that decides everything. A child whose engine could not be loaded
+            never gets far enough to send its window handle, so a short read here IS the
+            "this engine does not work on this machine" signal — and it costs nothing on the
+            success path, because the parent already blocks on it.
+        */
         unsigned long windowHandle;
-        auto actual = read (inChannel, &windowHandle, sizeof (windowHandle));
+        const auto actual = read (inChannel, &windowHandle, sizeof (windowHandle));
 
         if (actual != (ssize_t) sizeof (windowHandle))
         {
-            killChild();
-            return;
+            abandonStart();
+            return false;
         }
 
         receiver = std::make_unique<CommandReceiver> (static_cast<Responder*> (this), inChannel);
@@ -1739,6 +1806,29 @@ public:
 
         xembed = std::make_unique<XEmbedComponent> (windowHandle);
         browser.addAndMakeVisible (xembed.get());
+        return true;
+    }
+
+    /*  Undo a failed tryStart(). killChild() reaps the process but leaves the descriptors
+        open, and a retry calls pipe() again — so without this each attempt would leak four
+        of them, and the second attempt would poll stale ends of the first one's pipes.
+
+        Only reached before startThread(), so there is no thread to stop and no receiver yet.
+    */
+    void abandonStart()
+    {
+        killChild();
+
+        for (auto* fd : { &inChannel, &outChannel, &threadControl[0], &threadControl[1] })
+        {
+            if (*fd != 0)
+            {
+                close (*fd);
+                *fd = 0;
+            }
+        }
+
+        pfds.clear();
     }
 
     void quit()
@@ -1899,7 +1989,7 @@ private:
         */
         std::vector<String> environment;
 
-        if (const auto b = WebKitBundle::get(); const auto* generation = WebKitBundle::findGeneration (b))
+        if (const auto b = activeBundle; const auto* generation = WebKitBundle::findGeneration (b))
         {
             const std::pair<const char*, String> overrides[]
             {
@@ -2057,11 +2147,21 @@ private:
     //==============================================================================
     bool webKitIsAvailable = false;
 
+    /*  The bundle THIS webview is using, as opposed to the one that is configured. init()
+        clears it when the bundle turns out not to start, which is what makes the fallback to
+        the system engine take effect in launchChild() on the retry.
+    */
+    File activeBundle = WebKitBundle::get();
+
+    // Empty while the webview is working. Set only when no engine could be started at all.
+    String unavailableReason;
+
     WebBrowserComponent& browser;
     String userAgent;
     std::unique_ptr<CommandReceiver> receiver;
     int childProcess = 0, inChannel = 0, outChannel = 0;
-    int threadControl[2];
+    // Zero-initialised so abandonStart() cannot close a garbage descriptor when pipe() failed.
+    int threadControl[2] { 0, 0 };
     std::unique_ptr<XEmbedComponent> xembed;
     std::shared_ptr<int> livenessProbe = std::make_shared<int> (0);
     std::vector<pollfd> pfds;

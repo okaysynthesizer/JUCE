@@ -479,6 +479,11 @@ public:
         platform->fallbackPaint (webBrowserComponentContext);
     }
 
+    String getUnavailableReason() const
+    {
+        return platform->getUnavailableReason();
+    }
+
     void focusGainedWithDirection (FocusChangeType type, FocusChangeDirection dir)
     {
         platform->focusGainedWithDirection (type, dir);
@@ -504,6 +509,13 @@ private:
 
         virtual void focusGainedWithDirection (FocusChangeType, FocusChangeDirection) {}
         virtual void fallbackPaint (Graphics&) {}
+
+        /*  Empty unless the platform could not start a web engine at all. Only the Linux
+            backend can answer this today: it is the one platform where the engine is the
+            host machine's rather than the OS's, and so the one where "there is no webview"
+            is a state an application has to be able to show the user.
+        */
+        virtual String getUnavailableReason() const { return {}; }
     };
 
     static Options getOptions (const Options& optionsIn)
@@ -699,6 +711,13 @@ void WebBrowserComponent::refresh()
 {
     impl->refresh();
 }
+
+#if JUCE_LINUX || JUCE_BSD
+String WebBrowserComponent::getWebEngineUnavailableReason() const
+{
+    return impl->getUnavailableReason();
+}
+#endif
 
 void WebBrowserComponent::paint (Graphics& g)
 {

@@ -558,6 +558,23 @@ public:
         @see setWebKitBundleDirectory
     */
     static File getWebKitBundleDirectory();
+
+    /** Linux/BSD only. Returns an empty string while the webview is working, or a
+        human-readable explanation when no web engine could be started at all.
+
+        Linux is the one platform where the browser engine belongs to the user's machine
+        rather than to the OS, so "there is no webview" is a state that genuinely reaches
+        end users — a missing WebKitGTK, or a bundle that does not load on their
+        distribution. The component paints plain white in that case, which is
+        indistinguishable from a UI that failed to render, so an application that cares
+        should ask here and show something the user can act on.
+
+        Only meaningful once the component has been constructed; both the bundle and the
+        system engine have been tried by the time the constructor returns.
+
+        @see setWebKitBundleDirectory
+    */
+    String getWebEngineUnavailableReason() const;
    #endif
 
     //==============================================================================
