@@ -1260,6 +1260,21 @@ namespace DisplayHelpers
 
     static double getDisplayScale (const String& name, double dpi)
     {
+        /*  GDK_SCALE first, because it is the one scale signal that every other toolkit on the
+            machine already obeys, and because ignoring it is actively harmful rather than merely
+            incomplete: JUCE embeds WebKitGTK in a forked GTK child (see
+            juce_WebBrowserComponent_linux.cpp), and that child DOES read GDK_SCALE. If the two
+            processes disagree the browser lays the page out in a viewport scaled by the ratio
+            between them, so the page renders at the wrong size inside a correctly sized window.
+
+            Sessions that set it are common: it is the standard fix for tiny GTK apps under
+            XWayland, so KDE/Wayland users on HiDPI displays frequently export GDK_SCALE=2 —
+            precisely the configuration none of the checks below can see.
+        */
+        if (const auto gdkScale = SystemStats::getEnvironmentVariable ("GDK_SCALE", {}); gdkScale.isNotEmpty())
+            if (const auto parsed = gdkScale.getDoubleValue(); parsed > 0.0)
+                return parsed;
+
         if (auto* xSettings = XWindowSystem::getInstance()->getXSettings())
         {
             auto windowScalingFactorSetting = xSettings->getSetting (XWindowSystem::getWindowScalingFactorSettingName());
@@ -1323,7 +1338,15 @@ namespace DisplayHelpers
                         if (scaleFactor > 0.0)
                             return scaleFactor;
 
-                        return 1.0;
+                        /*  Deliberately falls through to the DPI heuristic rather than returning 1.
+                            GNOME's default for this key is "uint32 0", meaning "decide
+                            automatically" — not "the scale is 1". Treating 0 as an answer pinned
+                            every machine that merely has the GNOME schemas installed to scale 1,
+                            including KDE and other non-GNOME desktops that pull the schemas in as
+                            a dependency, and it did so *in preference to* the DPI heuristic that
+                            runs when the schemas are absent. Two otherwise identical machines
+                            therefore disagreed purely on whether an unrelated package was present.
+                        */
                     }
                 }
             }

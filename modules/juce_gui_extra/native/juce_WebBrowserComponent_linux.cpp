@@ -1894,6 +1894,35 @@ public:
 
 private:
     //==============================================================================
+    /*  The integer window scale to hand the child, matching the factor XEmbedComponent uses to
+        turn this component's logical bounds into the plug window's physical size
+        (see XEmbedComponent::getX11BoundsFromJuce).
+
+        The peer is usually still absent here — the browser is typically constructed before its
+        component reaches a desktop — so the primary display stands in for it. The two agree in
+        the ordinary case: Displays::Display::scale is the global scale times the detected one,
+        which is exactly platformScale * desktopScale for a window on that display. A window
+        opened on a secondary display of a different scale is the case this cannot get right,
+        and it is bounded: the page is laid out at the primary display's scale rather than at a
+        wrong one of its own choosing.
+    */
+    int getWindowScaleFactorForChild() const
+    {
+        const auto scale = [this]() -> double
+        {
+            if (auto* peer = browser.getPeer())
+                return peer->getPlatformScaleFactor() * peer->getComponent().getDesktopScaleFactor();
+
+            if (auto* display = Desktop::getInstance().getDisplays().getPrimaryDisplay())
+                return display->scale;
+
+            return 1.0;
+        }();
+
+        // GDK_SCALE is integer-only; a fractional platform scale has to land somewhere.
+        return jlimit (1, 4, roundToInt (scale));
+    }
+
     void killChild()
     {
         if (childProcess != 0)
@@ -1975,45 +2004,77 @@ private:
             return arg.toRawUTF8();
         });
 
-        /*  A bundled engine reaches the child through its environment, for two reasons that
-            point the same way: this is a fresh exec(), so nothing held in this process's
-            memory survives into it, and WebKitGTK will only be told where its helper
-            processes and injected bundle live through variables of its own.
+        /*  Everything the child needs that cannot be told to it any other way reaches it as an
+            environment variable: this is a fresh exec(), so nothing held in this process's
+            memory survives into it, and both GTK and WebKitGTK read the settings below once,
+            during their own start-up, before the child can be sent a single command.
 
-            The child gets its own environment rather than this one being mutated, because
-            this environment belongs to the host application — a DAW that never asked to
-            acquire these variables, and whose own library loading we must not perturb.
+            The child gets its own environment rather than this one being mutated, because this
+            environment belongs to the host application — a DAW that never asked to acquire
+            these variables, and whose own library loading we must not perturb.
 
             Assembled before the fork: between fork() and execve() the child may call only
             async-signal-safe functions, which is the same reason argv is built above.
         */
-        std::vector<String> environment;
+        std::vector<std::pair<const char*, String>> overrides;
 
+        /*  The child is embedded, via XEmbed, inside an X11 window this process owns, so it has
+            no choice about its GDK backend. gdk_set_allowed_backends ("x11") is called in the
+            child for this reason, but GDK_BACKEND in the environment takes PRECEDENCE over that
+            call — so a host launched from a Wayland session (which exports GDK_BACKEND=wayland)
+            brings up a Wayland GDK that cannot live in a foreign X11 window, and the web process
+            dies with "cannot open display". Setting it here rather than with setenv() in the
+            parent keeps the fix out of the host application's own environment.
+        */
+        overrides.emplace_back ("GDK_BACKEND", "x11");
+
+        /*  Pin the child's window scale to the same factor the parent uses to size the child's
+            X window, because the two are otherwise resolved independently and by different
+            rules. XEmbedComponent sizes the plug window in physical pixels
+            (logical * platformScale * desktopScale); the child's GTK divides whatever it is
+            given by its own scale factor to obtain the CSS viewport. When those disagree, the
+            page is laid out in a viewport scaled by the ratio between them, so the UI renders at
+            the wrong size — magnified and clipped when the child's scale is the larger of the
+            two, shrunken when it is the smaller — inside a window that is itself the right size.
+
+            GDK_DPI_SCALE is pinned alongside it because it is a second, independent multiplier
+            (a font-DPI one) that would otherwise compound on top of the factor chosen here.
+
+            Read once at gtk_init, so this is the scale for the lifetime of this child: a window
+            later moved to a display with a different scale keeps the factor it started with
+            until the browser is recreated.
+        */
+        overrides.emplace_back ("GDK_SCALE", String { getWindowScaleFactorForChild() });
+        overrides.emplace_back ("GDK_DPI_SCALE", "1");
+
+        /*  A bundled engine reaches the child the same way, and for the same reason: WebKitGTK
+            will only be told where its helper processes and injected bundle live through
+            variables of its own.
+        */
         if (const auto b = activeBundle; const auto* generation = WebKitBundle::findGeneration (b))
         {
-            const std::pair<const char*, String> overrides[]
-            {
-                { "JUCE_WEBKIT_BUNDLE_DIR",      b.getFullPathName() },
-                { "WEBKIT_EXEC_PATH",            WebKitBundle::execPath     (b, *generation).getFullPathName() },
-                { "WEBKIT_INJECTED_BUNDLE_PATH", WebKitBundle::injectedPath (b, *generation).getFullPathName() },
-            };
-
-            for (auto** entry = environ; entry != nullptr && *entry != nullptr; ++entry)
-            {
-                const String line { CharPointer_UTF8 { *entry } };
-                const auto name = line.upToFirstOccurrenceOf ("=", false, false);
-
-                const auto overridden = std::any_of (std::begin (overrides),
-                                                     std::end (overrides),
-                                                     [&] (const auto& o) { return name == o.first; });
-
-                if (! overridden)
-                    environment.push_back (line);
-            }
-
-            for (const auto& [name, value] : overrides)
-                environment.push_back (String { name } + "=" + value);
+            overrides.emplace_back ("JUCE_WEBKIT_BUNDLE_DIR",      b.getFullPathName());
+            overrides.emplace_back ("WEBKIT_EXEC_PATH",            WebKitBundle::execPath     (b, *generation).getFullPathName());
+            overrides.emplace_back ("WEBKIT_INJECTED_BUNDLE_PATH", WebKitBundle::injectedPath (b, *generation).getFullPathName());
         }
+
+        std::vector<String> environment;
+
+        for (auto** entry = environ; entry != nullptr && *entry != nullptr; ++entry)
+        {
+            const String line { CharPointer_UTF8 { *entry } };
+            const auto name = line.upToFirstOccurrenceOf ("=", false, false);
+
+            const auto overridden = std::any_of (overrides.begin(),
+                                                 overrides.end(),
+                                                 [&] (const auto& o) { return name == o.first; });
+
+            if (! overridden)
+                environment.push_back (line);
+        }
+
+        for (const auto& [name, value] : overrides)
+            environment.push_back (String { name } + "=" + value);
 
         std::vector<const char*> envp (environment.size() + 1, nullptr);
         std::transform (environment.begin(), environment.end(), envp.begin(), [] (const auto& entry)
@@ -2021,10 +2082,11 @@ private:
             return entry.toRawUTF8();
         });
 
-        /*  execve() handed this process's own environ is precisely execv(), so the two cases
-            share one call below rather than diverging.
+        /*  Always a constructed environment now, rather than sometimes this process's own:
+            the display and scale variables above are pinned for every child, not just the ones
+            pointed at a bundled engine.
         */
-        auto* const childEnvironment = environment.empty() ? environ : (char**) envp.data();
+        auto* const childEnvironment = (char**) envp.data();
 
         auto pid = fork();
 
