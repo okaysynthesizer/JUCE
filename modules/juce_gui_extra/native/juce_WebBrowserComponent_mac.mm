@@ -882,6 +882,16 @@ public:
         [preferences setValue: @(true) forKey: @"developerExtrasEnabled"];
        #endif
 
+       #if JUCE_IOS
+        // iPhone-idiom WebKit "text autosizing" boosts fonts inside any block wider
+        // than the visible width, and the legacy path ignores -webkit-text-size-adjust.
+        // A page that zooms its whole UI (every block "wide") gets every label doubled.
+        // Same private WKPreferences KVC pattern as the keys above; guarded so an
+        // OS that drops the setter just skips it instead of throwing.
+        if ([preferences respondsToSelector: NSSelectorFromString (@"_setTextAutosizingEnabled:")])
+            [preferences setValue: @(false) forKey: @"textAutosizingEnabled"];
+       #endif
+
        #if JUCE_MAC
         auto& webviewClass = [&]() -> auto&
         {
