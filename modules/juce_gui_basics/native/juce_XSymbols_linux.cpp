@@ -124,6 +124,7 @@ bool X11Symbols::loadAllSymbols()
                        makeSymbolBinding (xDisplayWidth,               "XDisplayWidth"),
                        makeSymbolBinding (xDisplayWidthMM,             "XDisplayWidthMM"),
                        makeSymbolBinding (xEventsQueued,               "XEventsQueued"),
+                       makeSymbolBinding (xResourceManagerString,      "XResourceManagerString"),
                        makeSymbolBinding (xFindContext,                "XFindContext"),
                        makeSymbolBinding (xFlush,                      "XFlush"),
                        makeSymbolBinding (xFree,                       "XFree"),

@@ -257,7 +257,22 @@ public:
                                  ResizableBorderComponent::Zone zone);
 
     static String getWindowScalingFactorSettingName()  { return "Gdk/WindowScalingFactor"; }
+    static String getFontDpiSettingName()              { return "Xft/DPI"; }
     static String getThemeNameSettingName()            { return "Net/ThemeName"; }
+
+    /** The desktop's font DPI expressed as a scale factor, i.e. dpi / 96, or 1.0 when nothing
+        sets one.
+
+        This is a page zoom as far as an embedded WebKitGTK view is concerned: since 2024 it
+        derives a page scale factor of fontDPI / 96 from GTK's gtk-xft-dpi and applies it on top
+        of the window scale, so it magnifies content and shrinks the CSS viewport without the
+        window changing size at all. Desktops that scale fractionally drive it hard — KDE has to,
+        because GDK_SCALE cannot express 150%.
+
+        Included in the display scale so that windows are sized for the magnification their
+        contents will actually receive; see getDisplayScale().
+    */
+    static double getFontDpiScale();
 
     //==============================================================================
     void handleWindowMessage (LinuxComponentPeer*, XEvent&) const;

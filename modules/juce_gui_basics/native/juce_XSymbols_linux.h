@@ -202,6 +202,14 @@ public:
                                          (::Display*, int),
                                          int)
 
+    /*  The raw RESOURCE_MANAGER string (xrdb). Parsed by hand where it is used rather than
+        through XrmGetStringDatabase/XrmGetResource, which would cost three more symbols to
+        pull out a single well-known key.
+    */
+    JUCE_GENERATE_FUNCTION_WITH_DEFAULT (XResourceManagerString, xResourceManagerString,
+                                         (::Display*),
+                                         char*)
+
     JUCE_GENERATE_FUNCTION_WITH_DEFAULT (XFindContext, xFindContext,
                                          (::Display*, XID, XContext, XPointer*),
                                          int)

@@ -1894,21 +1894,27 @@ public:
 
 private:
     //==============================================================================
-    /*  The integer window scale to hand the child, matching the factor XEmbedComponent uses to
-        turn this component's logical bounds into the plug window's physical size
-        (see XEmbedComponent::getX11BoundsFromJuce).
+    /*  What GDK_SCALE to hand the child so that its window scale ends up equal to the factor
+        XEmbedComponent uses to turn this component's logical bounds into the plug window's
+        physical size (XEmbedComponent::getX11BoundsFromJuce). Equality is the whole point: the
+        page's CSS viewport is the plug window divided by the child's scale, so any divergence
+        lays the page out at the wrong size inside a correctly sized window.
+
+        The value is a RESIDUAL, not the scale itself. GTK multiplies GDK_SCALE by the scale
+        XSETTINGS advertises, so handing the child the absolute figure double-applies whatever
+        the desktop already published — on a GNOME session advertising 2 that turns a correct
+        device pixel ratio of 2 into 4, and halves the viewport. Dividing it out first means the
+        child lands on exactly our scale whichever source ours came from, including the
+        dconf/gsettings/DPI fallbacks that GTK has no equivalent of and would otherwise miss.
 
         The peer is usually still absent here — the browser is typically constructed before its
         component reaches a desktop — so the primary display stands in for it. The two agree in
         the ordinary case: Displays::Display::scale is the global scale times the detected one,
-        which is exactly platformScale * desktopScale for a window on that display. A window
-        opened on a secondary display of a different scale is the case this cannot get right,
-        and it is bounded: the page is laid out at the primary display's scale rather than at a
-        wrong one of its own choosing.
+        which is exactly platformScale * desktopScale for a window on that display.
     */
     int getWindowScaleFactorForChild() const
     {
-        const auto scale = [this]() -> double
+        const auto ours = [this]() -> double
         {
             if (auto* peer = browser.getPeer())
                 return peer->getPlatformScaleFactor() * peer->getComponent().getDesktopScaleFactor();
@@ -1919,8 +1925,31 @@ private:
             return 1.0;
         }();
 
-        // GDK_SCALE is integer-only; a fractional platform scale has to land somewhere.
-        return jlimit (1, 4, roundToInt (scale));
+        const auto advertised = std::invoke ([]() -> double
+        {
+            if (auto* xSettings = XWindowSystem::getInstance()->getXSettings())
+            {
+                const auto setting = xSettings->getSetting (XWindowSystem::getWindowScalingFactorSettingName());
+
+                if (setting.isValid() && setting.integerValue > 0)
+                    return (double) setting.integerValue;
+            }
+
+            return 1.0;
+        });
+
+        /*  The font DPI comes back out before the residual is taken. Our scale includes it
+            (getDisplayScale folds it in so the window is sized for it), but the engine applies
+            that factor itself as a page zoom — putting it into GDK_SCALE as well would apply it
+            twice. Only the window-scale part of our figure is the child's business.
+        */
+        const auto deviceScale = ours / XWindowSystem::getFontDpiScale();
+
+        /*  GDK_SCALE is a positive integer, so a residual below 1 cannot be expressed. Clamping
+            to 1 leaves the child larger than we asked for rather than smaller, which keeps the
+            page readable and merely cropped instead of unusably tiny.
+        */
+        return jlimit (1, 4, roundToInt (deviceScale / advertised));
     }
 
     void killChild()
@@ -2028,24 +2057,19 @@ private:
         */
         overrides.emplace_back ("GDK_BACKEND", "x11");
 
-        /*  Pin the child's window scale to the same factor the parent uses to size the child's
-            X window, because the two are otherwise resolved independently and by different
-            rules. XEmbedComponent sizes the plug window in physical pixels
-            (logical * platformScale * desktopScale); the child's GTK divides whatever it is
-            given by its own scale factor to obtain the CSS viewport. When those disagree, the
-            page is laid out in a viewport scaled by the ratio between them, so the UI renders at
-            the wrong size — magnified and clipped when the child's scale is the larger of the
-            two, shrunken when it is the smaller — inside a window that is itself the right size.
+        /*  Bring the child's window scale into line with the factor the parent uses to size the
+            child's X window; see getWindowScaleFactorForChild for why this is a residual rather
+            than the scale itself, and why the two must match.
 
-            GDK_DPI_SCALE is pinned alongside it because it is a second, independent multiplier
-            (a font-DPI one) that would otherwise compound on top of the factor chosen here.
+            Overrides any GDK_SCALE inherited from the session rather than adding to it: ours is
+            computed from a display scale that already accounts for that variable, so honouring
+            it again here would apply it twice.
 
             Read once at gtk_init, so this is the scale for the lifetime of this child: a window
             later moved to a display with a different scale keeps the factor it started with
             until the browser is recreated.
         */
         overrides.emplace_back ("GDK_SCALE", String { getWindowScaleFactorForChild() });
-        overrides.emplace_back ("GDK_DPI_SCALE", "1");
 
         /*  A bundled engine reaches the child the same way, and for the same reason: WebKitGTK
             will only be told where its helper processes and injected bundle live through

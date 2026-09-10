@@ -1258,23 +1258,15 @@ namespace DisplayHelpers
         return 96.0;
     }
 
-    static double getDisplayScale (const String& name, double dpi)
+    /*  The scale the desktop advertises, before GDK_SCALE is applied on top of it.
+
+        This is the part GTK reads from XSETTINGS; getDisplayScale() below multiplies it by
+        GDK_SCALE to arrive at the figure GTK actually uses. Split out because the WebKitGTK
+        child JUCE forks needs the two factors separately, not just their product — see
+        juce_WebBrowserComponent_linux.cpp.
+    */
+    static double getBaseDisplayScale (const String& name, double dpi)
     {
-        /*  GDK_SCALE first, because it is the one scale signal that every other toolkit on the
-            machine already obeys, and because ignoring it is actively harmful rather than merely
-            incomplete: JUCE embeds WebKitGTK in a forked GTK child (see
-            juce_WebBrowserComponent_linux.cpp), and that child DOES read GDK_SCALE. If the two
-            processes disagree the browser lays the page out in a viewport scaled by the ratio
-            between them, so the page renders at the wrong size inside a correctly sized window.
-
-            Sessions that set it are common: it is the standard fix for tiny GTK apps under
-            XWayland, so KDE/Wayland users on HiDPI displays frequently export GDK_SCALE=2 —
-            precisely the configuration none of the checks below can see.
-        */
-        if (const auto gdkScale = SystemStats::getEnvironmentVariable ("GDK_SCALE", {}); gdkScale.isNotEmpty())
-            if (const auto parsed = gdkScale.getDoubleValue(); parsed > 0.0)
-                return parsed;
-
         if (auto* xSettings = XWindowSystem::getInstance()->getXSettings())
         {
             auto windowScalingFactorSetting = xSettings->getSetting (XWindowSystem::getWindowScalingFactorSettingName());
@@ -1338,15 +1330,7 @@ namespace DisplayHelpers
                         if (scaleFactor > 0.0)
                             return scaleFactor;
 
-                        /*  Deliberately falls through to the DPI heuristic rather than returning 1.
-                            GNOME's default for this key is "uint32 0", meaning "decide
-                            automatically" — not "the scale is 1". Treating 0 as an answer pinned
-                            every machine that merely has the GNOME schemas installed to scale 1,
-                            including KDE and other non-GNOME desktops that pull the schemas in as
-                            a dependency, and it did so *in preference to* the DPI heuristic that
-                            runs when the schemas are absent. Two otherwise identical machines
-                            therefore disagreed purely on whether an unrelated package was present.
-                        */
+                        return 1.0;
                     }
                 }
             }
@@ -1356,6 +1340,47 @@ namespace DisplayHelpers
         // We use the same approach as chromium which simply divides the dpi by 96
         // and then rounds the result
         return round (dpi / 96.0);
+    }
+
+    /*  GDK_SCALE is a MULTIPLIER on the desktop's advertised scale, not an alternative to it.
+        GTK applies both, so a GNOME session that publishes Gdk/WindowScalingFactor=2 (which is
+        how it drives fractional scaling: integer 2 with the font DPI wound back down) and also
+        exports GDK_SCALE=2 gives GTK windows a scale factor of 4, not 2.
+
+        JUCE has to arrive at the same number, because it forks a GTK child to host WebKitGTK
+        (juce_WebBrowserComponent_linux.cpp) and sizes that child's X window from this scale. If
+        the two disagree, the page is laid out in a viewport scaled by the ratio between them:
+        the window is the right size but its contents are not, magnified and clipped when the
+        child's factor is the larger.
+
+        Measured both ways on a GNOME/Wayland session with Gdk/WindowScalingFactor=2: exporting
+        GDK_SCALE=2 put the child at device pixel ratio 4 while JUCE, which used to ignore the
+        variable entirely, stayed at 2 and gave the page half the CSS pixels it needed. The
+        mirror case is a session with no XSETTINGS manager running, where the base is 1 and
+        GDK_SCALE alone is the whole story. Which sessions those are is not worth asserting here
+        — KDE, for one, may or may not have xsettingsd running depending on how GTK integration
+        was installed — so nothing below assumes a particular desktop: the base is read at
+        runtime and this multiplies whatever it turns out to be.
+
+        The font DPI is the third factor, and the only one the window cannot observe: WebKitGTK
+        turns it into a page zoom of its own accord, magnifying content inside a window whose
+        size never changes. Folding it in here is what keeps the CSS viewport at the size the
+        window was built for; see getFontDpiScale(). It is also the only one of the three that
+        can express a fractional scale, which is why desktops that offer 125%/150% steps reach
+        for it.
+    */
+    static double getDisplayScale (const String& name, double dpi)
+    {
+        const auto gdkScale = std::invoke ([]
+        {
+            if (const auto v = SystemStats::getEnvironmentVariable ("GDK_SCALE", {}); v.isNotEmpty())
+                if (const auto parsed = v.getDoubleValue(); parsed > 0.0)
+                    return parsed;
+
+            return 1.0;
+        });
+
+        return getBaseDisplayScale (name, dpi) * gdkScale * XWindowSystem::getFontDpiScale();
     }
 
    #if JUCE_USE_XINERAMA
@@ -2749,6 +2774,57 @@ static Rectangle<int> getWorkArea (const XWindowSystemUtilities::GetXProperty& p
     }
 
     return {};
+}
+
+double XWindowSystem::getFontDpiScale()
+{
+    const auto fontDpi = std::invoke ([]() -> double
+    {
+        /*  XSETTINGS first, because that is GTK's own order: where a settings manager is
+            running it overrides the resource database. Carried in 1024ths of a dot per inch,
+            the same convention as the gtk-xft-dpi property it feeds.
+        */
+        if (auto* xSettings = XWindowSystem::getInstance()->getXSettings())
+        {
+            const auto setting = xSettings->getSetting (getFontDpiSettingName());
+
+            if (setting.isValid() && setting.integerValue > 0)
+                return (double) setting.integerValue / 1024.0;
+        }
+
+        /*  Otherwise the resource database, which is where a desktop with no XSETTINGS manager
+            puts it — KDE being the case that matters, since it drives fractional scaling this
+            way. Plain dots per inch here, not 1024ths. The string belongs to the display and
+            must not be freed.
+        */
+        if (auto* display = XWindowSystem::getInstance()->getDisplay())
+        {
+            XWindowSystemUtilities::ScopedXLock xLock;
+
+            if (const auto* resourceString = X11Symbols::getInstance()->xResourceManagerString (display))
+            {
+                for (const auto& line : StringArray::fromLines (String { CharPointer_UTF8 { resourceString } }))
+                {
+                    if (line.trim().startsWithIgnoreCase (getFontDpiSettingName().replaceCharacter ('/', '.') + ":"))
+                    {
+                        const auto value = line.fromFirstOccurrenceOf (":", false, false).trim().getDoubleValue();
+
+                        if (value > 0.0)
+                            return value;
+                    }
+                }
+            }
+        }
+
+        return 96.0;
+    });
+
+    /*  Clamped rather than trusted: this multiplies the display scale, so a nonsense value in
+        the resource database would otherwise produce a nonsense window size. Values below 1 are
+        legitimate and kept — a desktop that pairs an integer window scale with a reduced font
+        DPI is asking for exactly that.
+    */
+    return jlimit (0.5, 4.0, fontDpi / 96.0);
 }
 
 Array<Displays::Display> XWindowSystem::findDisplays (float masterScale) const
