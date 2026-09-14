@@ -2776,6 +2776,19 @@ static Rectangle<int> getWorkArea (const XWindowSystemUtilities::GetXProperty& p
     return {};
 }
 
+double XWindowSystem::getAdvertisedWindowScale()
+{
+    if (auto* xSettings = XWindowSystem::getInstance()->getXSettings())
+    {
+        const auto setting = xSettings->getSetting (getWindowScalingFactorSettingName());
+
+        if (setting.isValid() && setting.integerValue > 0)
+            return (double) setting.integerValue;
+    }
+
+    return 1.0;
+}
+
 double XWindowSystem::getFontDpiScale()
 {
     const auto fontDpi = std::invoke ([]() -> double
@@ -2819,12 +2832,24 @@ double XWindowSystem::getFontDpiScale()
         return 96.0;
     });
 
-    /*  Clamped rather than trusted: this multiplies the display scale, so a nonsense value in
+    /*  Divided by the advertised window scale, because a published Xft/DPI is already expressed
+        in terms of it: GNOME drives its 2x window scale with Xft/DPI at 192, not 96, and a
+        1.5x text scale on top of that reads 288. Multiplying the raw figure into a scale that
+        already contains the window factor counts it twice — 2 x 2 for a desktop that only ever
+        asked for 2 — which collapses the usable area to a quarter and hands the window manager
+        a window the size of the monitor.
+
+        WebKitGTK divides it out the same way, which is the other reason to: the page zoom it
+        derives is what this has to predict, and that zoom is 1.0 on a plain 2x GNOME session
+        despite Xft/DPI reading 192.
+
+        Clamped rather than trusted: this multiplies the display scale, so a nonsense value in
         the resource database would otherwise produce a nonsense window size. Values below 1 are
         legitimate and kept — a desktop that pairs an integer window scale with a reduced font
         DPI is asking for exactly that.
     */
-    return jlimit (0.5, 4.0, fontDpi / 96.0);
+    const auto windowScale = jmax (1.0, getAdvertisedWindowScale());
+    return jlimit (0.5, 4.0, (fontDpi / 96.0) / windowScale);
 }
 
 Array<Displays::Display> XWindowSystem::findDisplays (float masterScale) const

@@ -1925,18 +1925,7 @@ private:
             return 1.0;
         }();
 
-        const auto advertised = std::invoke ([]() -> double
-        {
-            if (auto* xSettings = XWindowSystem::getInstance()->getXSettings())
-            {
-                const auto setting = xSettings->getSetting (XWindowSystem::getWindowScalingFactorSettingName());
-
-                if (setting.isValid() && setting.integerValue > 0)
-                    return (double) setting.integerValue;
-            }
-
-            return 1.0;
-        });
+        const auto advertised = jmax (1.0, XWindowSystem::getAdvertisedWindowScale());
 
         /*  The font DPI comes back out before the residual is taken. Our scale includes it
             (getDisplayScale folds it in so the window is sized for it), but the engine applies

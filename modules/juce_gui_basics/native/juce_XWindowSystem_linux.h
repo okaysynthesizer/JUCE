@@ -260,6 +260,14 @@ public:
     static String getFontDpiSettingName()              { return "Xft/DPI"; }
     static String getThemeNameSettingName()            { return "Net/ThemeName"; }
 
+    /** The integer window scale the desktop advertises through XSETTINGS, or 1.0 when no
+        settings manager is running (KDE commonly has none).
+
+        This is the factor GTK starts from before GDK_SCALE is applied on top, and the one a
+        published Xft/DPI is already expressed in terms of.
+    */
+    static double getAdvertisedWindowScale();
+
     /** The desktop's font DPI expressed as a scale factor, i.e. dpi / 96, or 1.0 when nothing
         sets one.
 
