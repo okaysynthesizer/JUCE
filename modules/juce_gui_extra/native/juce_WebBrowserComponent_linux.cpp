@@ -37,6 +37,9 @@
 struct WebKitURISchemeResponse;
 #endif
 
+// setrlimit(), for the realtime-priority cap launchChild() applies to the webview child.
+#include <sys/resource.h>
+
 /*  Declared by <unistd.h> under glibc, but spelled out here because launchChild() hands it
     to execve() explicitly, and this must resolve at global scope rather than inside
     namespace juce.
@@ -674,7 +677,20 @@ public:
 
             auto actual = read (inChannel, &dst[pos], static_cast<size_t> (len - pos));
 
-            if (actual <= 0)
+            /*  End of file: the other side has gone, and every later read will say so again at
+                once. read() leaves errno alone here, so the check below would act on whatever
+                an unrelated earlier call left in it — and the caller's poll() loop, which sees
+                POLLHUP immediately every time, would spin at full speed forever.
+            */
+            if (actual == 0)
+            {
+                if (responder != nullptr)
+                    responder->receiverHadError();
+
+                return;
+            }
+
+            if (actual < 0)
             {
                 if (errno == EINTR)
                     continue;
@@ -1640,6 +1656,13 @@ public:
 
     void evaluateJavascript (const String& script, EvaluationCallback callback) override
     {
+        if (! canSendToChild())
+        {
+            using Error = EvaluationResult::Error;
+            NullCheckedInvocation::invoke (callback, EvaluationResult { Error { Error::Type::unknown, unavailableReason } });
+            return;
+        }
+
         evaluationCallbacks.push_back (std::move (callback));
 
         CommandReceiver::sendCommand (outChannel,
@@ -1686,6 +1709,10 @@ public:
             jassertfalse;
             return;
         }
+
+        // Queued before the child died, perhaps; nobody is left to answer.
+        if (! canSendToChild())
+            return;
 
         auto response = browser.impl->handleResourceRequest (params->path);
         std::vector<std::byte> rawData;
@@ -1857,7 +1884,10 @@ public:
 
         if (childProcess != 0)
         {
-            CommandReceiver::sendCommand (outChannel, "quit", {});
+            // A child that has already gone still needs reaping, but cannot be told to quit.
+            if (! childExited)
+                CommandReceiver::sendCommand (outChannel, "quit", {});
+
             killChild();
         }
     }
@@ -1865,7 +1895,7 @@ public:
     //==============================================================================
     void goToURL (const String& url, const StringArray* headers, const MemoryBlock* postData) override
     {
-        if (! webKitIsAvailable)
+        if (! canSendToChild())
             return;
 
         DynamicObject::Ptr params = new DynamicObject;
@@ -1881,10 +1911,10 @@ public:
         CommandReceiver::sendCommand (outChannel, "goToURL", var (params.get()));
     }
 
-    void goBack() override    { if (webKitIsAvailable) CommandReceiver::sendCommand (outChannel, "goBack",    {}); }
-    void goForward() override { if (webKitIsAvailable) CommandReceiver::sendCommand (outChannel, "goForward", {}); }
-    void refresh() override   { if (webKitIsAvailable) CommandReceiver::sendCommand (outChannel, "refresh",   {}); }
-    void stop() override      { if (webKitIsAvailable) CommandReceiver::sendCommand (outChannel, "stop",      {}); }
+    void goBack() override    { if (canSendToChild()) CommandReceiver::sendCommand (outChannel, "goBack",    {}); }
+    void goForward() override { if (canSendToChild()) CommandReceiver::sendCommand (outChannel, "goForward", {}); }
+    void refresh() override   { if (canSendToChild()) CommandReceiver::sendCommand (outChannel, "refresh",   {}); }
+    void stop() override      { if (canSendToChild()) CommandReceiver::sendCommand (outChannel, "stop",      {}); }
 
     void resized()
     {
@@ -2108,6 +2138,29 @@ private:
             close (inPipe[0]);
             close (outPipe[1]);
 
+            /*  Forbid realtime scheduling to the webview and every process WebKit spawns
+                from it, which inherit this limit.
+
+                WebKitGTK promotes some of its own threads to SCHED_RR, first by calling
+                sched_setscheduler() directly — which succeeds for any user with an rtprio
+                allowance, as audio users commonly have — and then caps RLIMIT_RTTIME at the
+                RTTimeUSecMax that RealtimeKit reports. Inside a Flatpak that figure comes
+                from the Realtime portal, and on a host without rtkit the portal answers 0
+                rather than failing. WebKit then holds a realtime thread to a 0 µs budget,
+                the kernel SIGKILLs the child the moment that thread runs, and the editor is
+                left blank.
+
+                Nothing in a webview needs realtime priority, and inside a DAW it would only
+                compete with the audio threads. With RLIMIT_RTPRIO at 0 the direct promotion
+                fails and WebKit falls back to asking RealtimeKit, which grants a real budget
+                or refuses outright; either way nothing is left running under a zero one.
+
+                setrlimit() is a single system call, so like close() it is safe here between
+                fork() and execve().
+            */
+            const rlimit noRealtimePriority { 0, 0 };
+            setrlimit (RLIMIT_RTPRIO, &noRealtimePriority);
+
             if (JUCEApplicationBase::isStandaloneApp())
             {
                 execve (arguments[0].toRawUTF8(), (char**) argv.data(), childEnvironment);
@@ -2146,6 +2199,9 @@ private:
                 return;
 
             receiver->tryNextRead();
+
+            if (childExited)
+                return;
 
             int result = 0;
 
@@ -2189,7 +2245,7 @@ private:
     {
         int64 decision_id = inputParams.getProperty ("decision_id", var (0));
 
-        if (decision_id != 0)
+        if (decision_id != 0 && canSendToChild())
         {
             DynamicObject::Ptr params = new DynamicObject;
 
@@ -2217,10 +2273,37 @@ private:
                                    });
     }
 
-    void receiverHadError() override {}
+    /*  The child's end of the pipe is gone: it exited or was killed after the handshake, which
+        is the one failure init() cannot catch and retry. Called on this object's own thread,
+        which stops reading once it returns.
+
+        The component is left showing its fallback rather than a dead embed, with a reason a
+        caller can report through getWebEngineUnavailableReason().
+    */
+    void receiverHadError() override
+    {
+        childExited = true;
+
+        MessageManager::callAsync ([liveness = std::weak_ptr (livenessProbe), this]
+                                   {
+                                       if (liveness.lock() == nullptr)
+                                           return;
+
+                                       unavailableReason = "The WebKitGTK process exited unexpectedly"
+                                                           " after the web engine started.";
+                                       xembed = nullptr;
+                                       browser.repaint();
+                                   });
+    }
 
     //==============================================================================
+    /*  Nothing may be written to the child once it has gone: its pipe has no reader, so a
+        write raises SIGPIPE, which terminates a host that has not chosen to ignore it.
+    */
+    bool canSendToChild() const  { return webKitIsAvailable && ! childExited; }
+
     bool webKitIsAvailable = false;
+    std::atomic<bool> childExited { false };
 
     /*  The bundle THIS webview is using, as opposed to the one that is configured. init()
         clears it when the bundle turns out not to start, which is what makes the fallback to
